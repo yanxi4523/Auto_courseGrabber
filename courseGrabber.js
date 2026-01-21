@@ -53,7 +53,7 @@
     const MAX_FAILED_ATTEMPTS = 10;          // 最大连续失败次数
     const RETRY_DELAY = 3000;               // 重试延迟(毫秒)
     const CONCURRENT_ENABLED = true;        // 是否启用并发抢课
-    const CLICK2EXPEND_ENABLED = true;     // 用户设置: 是否在 jQuery 后自动展开目标课程信息，用于时间筛选和教师筛选
+    let CLICK2EXPEND_ENABLED = true;     // 用户设置: 是否在 jQuery 后自动展开目标课程信息，用于时间筛选和教师筛选
 
     let click2expend_enabled = true;       // 用于脚本自动关闭
 
@@ -81,7 +81,8 @@
     // 全局选课队列
     let selectingQueue = [];                // 正在处理的选课任务队列
     let isProcessingQueue = false;          // 是否正在处理队列
-
+// [新增] 抢余课模式开关
+    let ANY_COURSE_MODE = false;            // 是否开启无差别抢余课模式
     // 定时开抢相关
     let scheduledTime = null;               // 计划开抢时间
     let schedulerIntervalId = null;         // 定时器ID
@@ -96,6 +97,15 @@
      * @param {RegExp} [separatorRegex=/[，,;；]+/] - 分隔符正则
      * @returns {string[]} - 过滤后的非空字符串数组
      */
+    // [新增] 展开所有折叠的课程（修复抢余课扫描不到的问题）
+    function expandAllCourses() {
+        // 查找所有折叠的课程头
+        const heads = document.querySelectorAll('.panel-heading.kc_head');
+        if(heads.length > 0) {
+            log(`[抢余课] 尝试展开 ${heads.length} 个折叠课程...`, 'info');
+            heads.forEach(head => head.click());
+        }
+    }
     function safeParseFilterInput(input, separatorRegex = /[，,;；]+/) {
         if (!input || typeof input !== 'string') {
             return [];
@@ -1242,99 +1252,164 @@
             log(`已重置尝试列表，继续监控`, 'info', courseCode);
         }
     }
+// 主抢课逻辑（多课程并发版）
+function attemptGrabCourse() {
+    attemptCount++;
 
-    // 主抢课逻辑（多课程并发版）
-    function attemptGrabCourse() {
-        attemptCount++;
+    if (attemptCount > MAX_ATTEMPTS) {
+        log(`已达到最大尝试次数 ${MAX_ATTEMPTS}，停止抢课`, 'warning');
+        stopGrabbing();
+        return;
+    }
 
-        if (attemptCount > MAX_ATTEMPTS) {
-            log(`已达到最大尝试次数 ${MAX_ATTEMPTS}，停止抢课`, 'warning');
-            stopGrabbing();
-            return;
+    // [修改] 如果开启了抢余课模式，优先执行
+    if (ANY_COURSE_MODE) {
+        log(`第 ${attemptCount} 次扫描余课...`, 'info');
+        attemptGrabAnyAvailableCourse();
+        return; // 抢余课模式下，不再执行下面的指定课程逻辑
+    }
+
+    if (activeCourses.size === 0) {
+        log('所有课程已完成', 'success');
+        stopGrabbing();
+        return;
+    }
+
+    log(`第 ${attemptCount} 次尝试抢课 (活跃课程: ${activeCourses.size})`);
+
+    // 原有的原有抢指定课程代码
+    // (保持原有的 sortedCourses 和 for循环不变)
+    const sortedCourses = Array.from(activeCourses).sort((a, b) => {
+        // 这里可以添加排序逻辑，比如优先级排序
+        return 0; // 暂时返回0，保持原有顺序
+    });
+    
+    // 原有的课程选择逻辑
+    // ...
+}
+
+// [新增] 无差别抢余课逻辑
+function attemptGrabAnyAvailableCourse() {
+    // 查找所有表格行（通常正方教务系统的课程都在 tr 中）
+    const allRows = document.querySelectorAll('table tbody tr');
+    let foundAvailable = false;
+
+    for (let row of allRows) {
+        const rowText = row.textContent || '';
+        
+        // 1. 必须包含"选课"字样，且不能包含"退选"
+        // 排除表头和已经选上的课
+        if (!rowText.includes('选课') || rowText.includes('退选')) {
+            continue;
         }
 
-        if (activeCourses.size === 0) {
-            log('所有课程已完成', 'success');
-            stopGrabbing();
-            return;
+        // 2. 检查是否有可点击的按钮
+        const selectButton = row.querySelector('button, a, input[type="button"], [onclick]');
+        if (!selectButton) continue;
+
+        // 3. 构造一个临时的 teachingClass 对象，复用原有的提取逻辑
+        const info = extractTeachingClassInfo(row);
+        
+        // 构造对象用于检查容量
+        const tc = {
+            row: row,
+            info: info,
+            courseCode: info.className || '抢余课模式', // 使用课程名作为代号
+            button: selectButton
+        };
+
+        // 4. 关键检查：是否已满
+        // 复用原有的 checkTeachingClassCapacity 函数（它会检查 .full 元素是否可见）
+        const hasCapacity = checkTeachingClassCapacity(tc);
+
+        if (hasCapacity) {
+            // 再次确认：排除被全局过滤器过滤掉的课程（可选，如果想完全无视过滤器可注释掉下面几行）
+            // const filterResult = matchesFilters(tc, 'ANY');
+            // if (!filterResult.match) continue;
+
+            log(`🔥 [抢余课] 发现可用课程: ${info.className} (${info.teacher})`, 'success');
+            
+            // 5. 立即选课
+            // 我们直接复用 selectTeachingClass，但要小心它依赖 courseStates
+            // 为了避免报错，我们需要动态注册这个课程状态
+            const tempCode = info.className; 
+            if (!courseStates.has(tempCode)) {
+                initCourseState(tempCode);
+                // 临时添加到活跃列表以骗过某些检查，选完后再清理也可以
+                activeCourses.add(tempCode); 
+            }
+            
+            // 修改 tc 的 courseCode 以匹配状态
+            tc.courseCode = tempCode;
+
+            selectTeachingClass(tc);
+            foundAvailable = true;
+            
+            // 贪婪模式：一次循环只选一个，避免并发请求过多导致封号，或者 return 让主循环处理
+            return true; 
         }
+    }
+    
+    if (!foundAvailable) {
+        log('未找到可用余课', 'info');
+    }
+    return false;
+}
+    // 开始抢课
+function startGrabbing(customCourses = null) {
+    if (isRunning) {
+        log('抢课脚本已在运行中！', 'warning');
+        return;
+    }
 
-        log(`第 ${attemptCount} 次尝试抢课 (活跃课程: ${activeCourses.size})`);
-
-        // 按优先级排序课程
-        const sortedCourses = Array.from(activeCourses).sort((a, b) => {
-            const courseA = TARGET_COURSES.find(c => c.code === a);
-            const courseB = TARGET_COURSES.find(c => c.code === b);
-            const priorityA = courseA ? courseA.priority : 999;
-            const priorityB = courseB ? courseB.priority : 999;
-            return priorityA - priorityB;
-        });
-
-        // 并发模式：同时尝试所有课程
-        if (CONCURRENT_ENABLED) {
-            for (let courseCode of sortedCourses) {
-                attemptGrabSingleCourse(courseCode);
-            }
-        } else {
-            // 顺序模式：按优先级依次尝试
-            for (let courseCode of sortedCourses) {
-                const state = getCourseState(courseCode);
-                if (!state.selecting) {
-                    attemptGrabSingleCourse(courseCode);
-                    break; // 只尝试一个课程，等待结果
-                }
-            }
+    // [修改] 只有在非抢余课模式下，才强制检查课程列表
+    if (!ANY_COURSE_MODE) {
+        const coursesToGrab = customCourses || TARGET_COURSES;
+        if (!coursesToGrab || coursesToGrab.length === 0) {
+            log('❌ 未配置目标课程！', 'error');
+            alert('请配置课程，或使用"抢余课模式"！'); // 修改提示
+            return;
         }
     }
 
-    // 开始抢课
-    function startGrabbing(customCourses = null) {
-        if (isRunning) {
-            log('抢课脚本已在运行中！', 'warning');
-            return;
-        }
+    // 请求通知权限
+    if (window.Notification && Notification.permission === 'default') {
+        Notification.requestPermission();
+    }
 
-        // 使用自定义课程或默认课程
+    isRunning = true;
+    attemptCount = 0;
+    refreshInProgress = false;
+    if (refreshTimeoutId) {
+        clearTimeout(refreshTimeoutId);
+        refreshTimeoutId = null;
+    }
+
+    // 初始化课程状态
+    courseStates.clear();
+    selectedCourses.clear();
+    activeCourses.clear();
+
+    // [新增] 只有在有目标课程时才初始化 activeCourses
+    if (customCourses || TARGET_COURSES.length > 0) {
         const coursesToGrab = customCourses || TARGET_COURSES;
-
-        if (!coursesToGrab || coursesToGrab.length === 0) {
-            log('❌ 未配置目标课程！请先配置 TARGET_COURSES 或传入课程列表', 'error');
-            alert('请先配置目标课程！\n\n在脚本中修改 TARGET_COURSES 数组，或使用：\ncourseGrabber.start([{code: "课程号", priority: 1}])');
-            return;
-        }
-
-        // 请求通知权限
-        if (window.Notification && Notification.permission === 'default') {
-            Notification.requestPermission();
-        }
-
-        isRunning = true;
-        attemptCount = 0;
-        refreshInProgress = false;
-        if (refreshTimeoutId) {
-            clearTimeout(refreshTimeoutId);
-            refreshTimeoutId = null;
-        }
-
-        // 初始化课程状态
-        courseStates.clear();
-        selectedCourses.clear();
-        activeCourses.clear();
-
         for (let course of coursesToGrab) {
             const courseCode = typeof course === 'string' ? course : course.code;
             activeCourses.add(courseCode);
             initCourseState(courseCode);
         }
+    }
 
-        // 自动判断是否需要展开功能（用于时间/教师过滤）
-        // 如果没有任何过滤器配置，则无需展开课程详情
-        const needsFiltering = (() => {
-            // 检查全局过滤器
-            if (GLOBAL_TIME_FILTER.length > 0 || GLOBAL_TEACHER_FILTER.length > 0) {
-                return true;
-            }
-            // 检查每门课程的单独过滤器
+    // 自动判断是否需要展开功能（用于时间/教师过滤）
+    // 如果没有任何过滤器配置，则无需展开课程详情
+    const needsFiltering = (() => {
+        // 检查全局过滤器
+        if (GLOBAL_TIME_FILTER.length > 0 || GLOBAL_TEACHER_FILTER.length > 0) {
+            return true;
+        }
+        // 检查每门课程的单独过滤器
+        if (customCourses || TARGET_COURSES.length > 0) {
+            const coursesToGrab = customCourses || TARGET_COURSES;
             for (let course of coursesToGrab) {
                 if (typeof course === 'object') {
                     if ((course.timeFilter && course.timeFilter.length > 0) ||
@@ -1343,33 +1418,42 @@
                     }
                 }
             }
-            return false;
-        })();
-
-        // 根据是否需要过滤自动设置 click2expend_enabled
-        if (!needsFiltering) {
-            click2expend_enabled = false;
-            log('📌 未检测到时间/教师过滤器配置，已自动禁用课程展开功能', 'info');
-        } else {
-            click2expend_enabled = true;
-            log('📌 检测到过滤器配置，已自动启用课程展开功能', 'info');
         }
+        return false;
+    })();
 
-        log(`🚀 开始监控 ${activeCourses.size} 门课程`, 'success');
+    // 根据是否需要过滤自动设置 click2expend_enabled
+    if (!needsFiltering) {
+        click2expend_enabled = false;
+        log('📌 未检测到时间/教师过滤器配置，已自动禁用课程展开功能', 'info');
+    } else {
+        click2expend_enabled = true;
+        log('📌 检测到过滤器配置，已自动启用课程展开功能', 'info');
+    }
+
+    log(`🚀 开始抢课 (模式: ${ANY_COURSE_MODE ? '抢余课模式' : '指定课程模式'})`, 'success');
+    
+    // 只在指定课程模式下显示课程列表
+    if (!ANY_COURSE_MODE && (customCourses || TARGET_COURSES.length > 0)) {
+        const coursesToGrab = customCourses || TARGET_COURSES;
         log(`📋 课程列表: ${Array.from(activeCourses).join(', ')}`, 'info');
-        log(`⏱️ 检查间隔: ${CHECK_INTERVAL / 1000} 秒`, 'info');
-        log(`🎯 最大尝试次数: ${MAX_ATTEMPTS}`, 'info');
-        log(`⚡ 并发模式: ${CONCURRENT_ENABLED ? '启用' : '禁用'}`, 'info');
+    }
+    
+    log(`⏱️ 检查间隔: ${CHECK_INTERVAL / 1000} 秒`, 'info');
+    log(`🎯 最大尝试次数: ${MAX_ATTEMPTS}`, 'info');
+    log(`⚡ 并发模式: ${CONCURRENT_ENABLED ? '启用' : '禁用'}`, 'info');
 
-        // 显示过滤器配置
-        if (GLOBAL_TIME_FILTER.length > 0) {
-            log(`🔍 全局时间过滤: ${GLOBAL_TIME_FILTER.join(', ')}`, 'info');
-        }
-        if (GLOBAL_TEACHER_FILTER.length > 0) {
-            log(`🔍 全局教师过滤: ${GLOBAL_TEACHER_FILTER.join(', ')}`, 'info');
-        }
+    // 显示过滤器配置（只在启用时显示）
+    if (GLOBAL_TIME_FILTER.length > 0) {
+        log(`🔍 全局时间过滤: ${GLOBAL_TIME_FILTER.join(', ')}`, 'info');
+    }
+    if (GLOBAL_TEACHER_FILTER.length > 0) {
+        log(`🔍 全局教师过滤: ${GLOBAL_TEACHER_FILTER.join(', ')}`, 'info');
+    }
 
-        // 显示每门课程的特定过滤器
+    // 显示每门课程的特定过滤器（只在指定课程模式下且课程存在时显示）
+    if (!ANY_COURSE_MODE && (customCourses || TARGET_COURSES.length > 0)) {
+        const coursesToGrab = customCourses || TARGET_COURSES;
         for (let course of coursesToGrab) {
             if (typeof course === 'object') {
                 if (course.timeFilter && course.timeFilter.length > 0) {
@@ -1380,50 +1464,51 @@
                 }
             }
         }
+    }
 
-        // 立即执行一次
-        attemptGrabCourse();
+    // 立即执行一次
+    attemptGrabCourse();
 
-        // 设置定时器
-        intervalId = setInterval(() => {
-            // 每8次尝试刷新一次课程列表
-            // 注意：attemptCount 在 attemptGrabCourse() 内部自增；如果这里先走“刷新分支”，
-            // attemptGrabCourse() 会被延迟 1s，这段时间内 attemptCount 不变，会导致下一次 interval 再次满足 %8===0，
-            // 从而出现“已触发jQuery搜索刷新”连续打印两次的现象。
-            if (attemptCount > 0 && attemptCount % 3 === 0 && !refreshInProgress) {
-                refreshInProgress = true;
-                refreshCourseList();
-                refreshTimeoutId = setTimeout(() => {
-                    refreshInProgress = false;
-                    refreshTimeoutId = null;
-                    attemptGrabCourse();
-                }, 1000); // 刷新后等待1秒再尝试
-            } else {
+    // 设置定时器
+    intervalId = setInterval(() => {
+        // 每8次尝试刷新一次课程列表
+        // 注意：attemptCount 在 attemptGrabCourse() 内部自增；如果这里先走"刷新分支"，
+        // attemptGrabCourse() 会被延迟 1s，这段时间内 attemptCount 不变，会导致下一次 interval 再次满足 %8===0，
+        // 从而出现"已触发jQuery搜索刷新"连续打印两次的现象。
+        if (attemptCount > 0 && attemptCount % 3 === 0 && !refreshInProgress) {
+            refreshInProgress = true;
+            refreshCourseList();
+            refreshTimeoutId = setTimeout(() => {
+                refreshInProgress = false;
+                refreshTimeoutId = null;
                 attemptGrabCourse();
-            }
-        }, CHECK_INTERVAL);
+            }, 1000); // 刷新后等待1秒再尝试
+        } else {
+            attemptGrabCourse();
+        }
+    }, CHECK_INTERVAL);
+}
+
+// 停止抢课
+function stopGrabbing() {
+    if (!isRunning) {
+        log('抢课脚本未运行', 'info');
+        return;
     }
 
-    // 停止抢课
-    function stopGrabbing() {
-        if (!isRunning) {
-            log('抢课脚本未运行', 'info');
-            return;
-        }
-
-        isRunning = false;
-        refreshInProgress = false;
-        if (intervalId) {
-            clearInterval(intervalId);
-            intervalId = null;
-        }
-        if (refreshTimeoutId) {
-            clearTimeout(refreshTimeoutId);
-            refreshTimeoutId = null;
-        }
-
-        log('⏹️ 抢课脚本已停止', 'warning');
+    isRunning = false;
+    refreshInProgress = false;
+    if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
     }
+    if (refreshTimeoutId) {
+        clearTimeout(refreshTimeoutId);
+        refreshTimeoutId = null;
+    }
+
+    log('⏹️ 抢课脚本已停止', 'warning');
+}
 
     // 获取状态
     function getStatus() {
@@ -1723,432 +1808,434 @@
         }
     }
 
-    // ========== UI界面 ==========
-    // 创建UI控制面板
-    function createUI() {
-        // 检查是否已存在UI
-        if (document.getElementById('courseGrabberUI')) {
-            return;
-        }
-
-        // 创建样式
-        const style = document.createElement('style');
-        style.textContent = `
-            #courseGrabberUI {
-                position: fixed;
-                top: 20px;
-                right: 20px;
-                width: 420px;
-                max-height: 90vh;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                border-radius: 16px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                z-index: 999999;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                color: white;
-                overflow: hidden;
-                display: flex;
-                flex-direction: column;
-            }
-            #courseGrabberUI * {
-                box-sizing: border-box;
-            }
-            .cg-header {
-                padding: 20px;
-                background: rgba(0,0,0,0.2);
-                cursor: move;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                user-select: none;
-            }
-            .cg-title {
-                font-size: 18px;
-                font-weight: bold;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
-            .cg-close {
-                background: rgba(255,255,255,0.2);
-                border: none;
-                color: white;
-                width: 32px;
-                height: 32px;
-                border-radius: 8px;
-                cursor: pointer;
-                font-size: 18px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                transition: all 0.3s;
-            }
-            .cg-close:hover {
-                background: rgba(255,255,255,0.3);
-                transform: rotate(90deg);
-            }
-            .cg-body {
-                padding: 20px;
-                overflow-y: auto;
-                flex: 1;
-            }
-            .cg-section {
-                background: rgba(255,255,255,0.1);
-                border-radius: 12px;
-                padding: 16px;
-                margin-bottom: 16px;
-                backdrop-filter: blur(10px);
-            }
-            .cg-section-title {
-                font-size: 14px;
-                font-weight: bold;
-                margin-bottom: 12px;
-                opacity: 0.9;
-                display: flex;
-                align-items: center;
-                gap: 6px;
-            }
-            .cg-input {
-                width: 100%;
-                padding: 10px 12px;
-                border: 2px solid rgba(255,255,255,0.2);
-                background: rgba(255,255,255,0.1);
-                border-radius: 8px;
-                color: white;
-                font-size: 13px;
-                margin-bottom: 8px;
-                transition: all 0.3s;
-            }
-            .cg-input:focus {
-                outline: none;
-                border-color: rgba(255,255,255,0.5);
-                background: rgba(255,255,255,0.15);
-            }
-            .cg-input::placeholder {
-                color: rgba(255,255,255,0.5);
-            }
-            .cg-btn {
-                padding: 10px 20px;
-                border: none;
-                border-radius: 8px;
-                cursor: pointer;
-                font-size: 13px;
-                font-weight: bold;
-                transition: all 0.3s;
-                display: inline-flex;
-                align-items: center;
-                gap: 6px;
-                justify-content: center;
-            }
-            .cg-btn-primary {
-                background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
-                color: #333;
-            }
-            .cg-btn-primary:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 8px 20px rgba(67,233,123,0.4);
-            }
-            .cg-btn-danger {
-                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-                color: white;
-            }
-            .cg-btn-danger:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 8px 20px rgba(245,87,108,0.4);
-            }
-            .cg-btn-secondary {
-                background: rgba(255,255,255,0.2);
-                color: white;
-            }
-            .cg-btn-secondary:hover {
-                background: rgba(255,255,255,0.3);
-            }
-            .cg-btn-small {
-                padding: 6px 12px;
-                font-size: 12px;
-            }
-            .cg-btn-group {
-                display: flex;
-                gap: 8px;
-                margin-top: 12px;
-            }
-            .cg-course-list {
-                max-height: 200px;
-                overflow-y: auto;
-                margin-top: 12px;
-            }
-            .cg-course-item {
-                background: rgba(255,255,255,0.1);
-                padding: 12px;
-                border-radius: 8px;
-                margin-bottom: 8px;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                transition: all 0.3s;
-            }
-            .cg-course-item:hover {
-                background: rgba(255,255,255,0.15);
-            }
-            .cg-course-info {
-                flex: 1;
-                font-size: 13px;
-            }
-            .cg-course-code {
-                font-weight: bold;
-                margin-bottom: 4px;
-            }
-            .cg-course-meta {
-                font-size: 11px;
-                opacity: 0.8;
-            }
-            .cg-status {
-                padding: 8px 16px;
-                background: rgba(255,255,255,0.1);
-                border-radius: 8px;
-                font-size: 13px;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                margin-bottom: 8px;
-            }
-            .cg-status-dot {
-                width: 8px;
-                height: 8px;
-                border-radius: 50%;
-                background: #43e97b;
-                animation: pulse 2s infinite;
-            }
-            @keyframes pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.5; }
-            }
-            .cg-log-area {
-                background: rgba(0,0,0,0.3);
-                border-radius: 8px;
-                padding: 12px;
-                max-height: 150px;
-                overflow-y: auto;
-                font-size: 11px;
-                font-family: 'Monaco', 'Menlo', monospace;
-                line-height: 1.6;
-            }
-            .cg-log-item {
-                margin-bottom: 4px;
-                opacity: 0.9;
-            }
-            .cg-log-success { color: #43e97b; }
-            .cg-log-error { color: #f5576c; }
-            .cg-log-warning { color: #ffa500; }
-            .cg-log-info { color: #38f9d7; }
-            .cg-badge {
-                display: inline-block;
-                padding: 4px 8px;
-                background: rgba(255,255,255,0.2);
-                border-radius: 4px;
-                font-size: 11px;
-                margin-left: 8px;
-            }
-            .cg-badge-success {
-                background: rgba(67,233,123,0.3);
-            }
-            .cg-badge-running {
-                background: rgba(56,249,215,0.3);
-            }
-            .cg-controls {
-                display: flex;
-                gap: 8px;
-            }
-            .cg-minimize {
-                background: rgba(255,255,255,0.2);
-                border: none;
-                color: white;
-                width: 32px;
-                height: 32px;
-                border-radius: 8px;
-                cursor: pointer;
-                font-size: 16px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                transition: all 0.3s;
-            }
-            .cg-minimize:hover {
-                background: rgba(255,255,255,0.3);
-            }
-            .cg-minimized {
-                height: auto !important;
-                width: 60px !important;
-            }
-            .cg-minimized .cg-body {
-                display: none !important;
-            }
-            .cg-minimized .cg-title {
-                display: none !important;
-            }
-            .cg-filter-input {
-                font-size: 12px;
-                margin-bottom: 4px;
-            }
-            .cg-help-text {
-                font-size: 11px;
-                opacity: 0.7;
-                margin-top: 4px;
-            }
-            .cg-timer-display {
-                background: rgba(255,255,255,0.15);
-                padding: 16px;
-                border-radius: 8px;
-                text-align: center;
-                font-size: 24px;
-                font-weight: bold;
-                letter-spacing: 2px;
-                margin-top: 12px;
-                font-family: 'Monaco', 'Menlo', monospace;
-            }
-            .cg-timer-active {
-                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-                animation: timerPulse 2s infinite;
-            }
-            @keyframes timerPulse {
-                0%, 100% { transform: scale(1); }
-                50% { transform: scale(1.02); }
-            }
-            .cg-time-input-group {
-                display: flex;
-                gap: 8px;
-                align-items: center;
-            }
-            .cg-time-input-group input {
-                flex: 1;
-            }
-            .cg-course-filters {
-                background: rgba(0,0,0,0.2);
-                padding: 8px;
-                border-radius: 6px;
-                margin-top: 6px;
-                font-size: 11px;
-            }
-            .cg-course-filter-item {
-                margin-bottom: 4px;
-                display: flex;
-                align-items: center;
-                gap: 4px;
-            }
-            .cg-course-filter-item:last-child {
-                margin-bottom: 0;
-            }
-            .cg-filter-label {
-                opacity: 0.8;
-                min-width: 40px;
-            }
-            .cg-course-actions {
-                display: flex;
-                gap: 4px;
-                flex-direction: column;
-            }
-        `;
-        document.head.appendChild(style);
-
-        // 创建UI容器
-        const ui = document.createElement('div');
-        ui.id = 'courseGrabberUI';
-        ui.innerHTML = `
-            <div class="cg-header">
-                <div class="cg-title">
-                    <span>🎓</span>
-                    <span>自动抢课</span>
-                </div>
-                <div class="cg-controls">
-                    <button class="cg-minimize" id="cg-minimize-btn" title="最小化">−</button>
-                    <button class="cg-close" id="cg-close-btn" title="关闭">×</button>
-                </div>
-            </div>
-            <div class="cg-body">
-                <!-- 状态显示 -->
-                <div class="cg-section">
-                    <div class="cg-section-title">📊 运行状态</div>
-                    <div id="cg-status-display">
-                        <div class="cg-status">
-                            <span>状态:</span>
-                            <span id="cg-status-text">未运行</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 课程管理 -->
-                <div class="cg-section">
-                    <div class="cg-section-title">📚 添加目标课程</div>
-                    <input type="text" class="cg-input" id="cg-course-code" placeholder="课程号或课程名称 (例: 23286514 或 机器学习)">
-                    <input type="number" class="cg-input" id="cg-course-priority" placeholder="优先级 (数字越小优先级越高)" value="1" min="1">
-                    
-                    <div class="cg-section-title" style="font-size: 13px; margin-top: 12px; margin-bottom: 8px;"> 目标课程的过滤器 (可选)</div>
-                    <input type="text" class="cg-input cg-filter-input" id="cg-time-filter" placeholder="时间过滤 (例: 星期一,第1-2节)">
-                    <div class="cg-help-text">多个关键词用逗号分隔，满足任意一个即可</div>
-                    <input type="text" class="cg-input cg-filter-input" id="cg-teacher-filter" placeholder="教师过滤 (例: 张三,讲师)">
-                    <div class="cg-help-text">支持教师姓名或职称，满足任意一个即可</div>
-
-                    <div class="cg-section-title" style="font-size: 13px; margin-top: 12px; margin-bottom: 8px;"> 替换课程 (可选)</div>
-                    <input type="text" class="cg-input cg-filter-input" id="cg-replace-code" placeholder="要替换的课程号 (例: 23306047)">
-                    <div class="cg-help-text">选中新课程前，先退选此课程（用于换课）</div>
-                    
-                    <button class="cg-btn cg-btn-secondary cg-btn-small" id="cg-add-course" style="width: 100%; margin-top: 12px;">➕ 添加课程</button>
-                </div>
-
-                <!-- 目标课程列表 -->
-                <div class="cg-section">
-                    <div class="cg-section-title">📋 目标课程列表</div>
-                    <div class="cg-course-list" id="cg-course-list"></div>
-                </div>
-
-                <!-- 定时开抢 -->
-                <div class="cg-section">
-                    <div class="cg-section-title">⏰ 定时开抢</div>
-                    <div class="cg-time-input-group">
-                        <input type="datetime-local" class="cg-input" id="cg-schedule-time" placeholder="选择开抢时间">
-                        <button class="cg-btn cg-btn-secondary cg-btn-small" id="cg-schedule-btn">确定</button>
-                    </div>
-                    <div class="cg-help-text">设置自动开抢时间，到时自动开始抢课</div>
-                    <div id="cg-timer-display" style="display: none;"></div>
-                </div>
-
-                <!-- 控制按钮 -->
-                <div class="cg-section">
-                    <div class="cg-btn-group">
-                        <button class="cg-btn cg-btn-primary" id="cg-start-btn" style="flex: 1;">🚀 开始抢课</button>
-                        <button class="cg-btn cg-btn-danger" id="cg-stop-btn" style="flex: 1;" disabled>⏹️ 停止</button>
-                    </div>
-                    <div class="cg-btn-group">
-                        <button class="cg-btn cg-btn-secondary cg-btn-small" id="cg-status-btn" style="flex: 1;">📊 查看状态</button>
-                        <button class="cg-btn cg-btn-secondary cg-btn-small" id="cg-debug-btn" style="flex: 1;">🔍 调试</button>
-                    </div>
-                </div>
-
-                <!-- 日志显示 -->
-                <div class="cg-section">
-                    <div class="cg-section-title">📝 运行日志</div>
-                    <div class="cg-log-area" id="cg-log-area"></div>
-                </div>
-            </div>
-        `;
-
-        document.body.appendChild(ui);
-
-        // 添加拖拽功能
-        makeDraggable(ui);
-
-        // 绑定事件
-        bindUIEvents();
-
-        // 初始化课程列表
-        updateCourseList();
-
-        // 劫持日志函数以显示在UI中
-        interceptLogs();
-
-        console.log('%c✨ UI界面已加载！可拖动面板到任意位置', 'color: #43e97b; font-weight: bold; font-size: 14px;');
+ // ========== UI界面 ==========
+// 创建UI控制面板
+function createUI() {
+    // 检查是否已存在UI
+    if (document.getElementById('courseGrabberUI')) {
+        return;
     }
 
+    // 创建样式
+    const style = document.createElement('style');
+    style.textContent = `
+        #courseGrabberUI {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            width: 420px;
+            max-height: 90vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            z-index: 999999;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: white;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        #courseGrabberUI * {
+            box-sizing: border-box;
+        }
+        .cg-header {
+            padding: 20px;
+            background: rgba(0,0,0,0.2);
+            cursor: move;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            user-select: none;
+        }
+        .cg-title {
+            font-size: 18px;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .cg-close {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+        }
+        .cg-close:hover {
+            background: rgba(255,255,255,0.3);
+            transform: rotate(90deg);
+        }
+        .cg-body {
+            padding: 20px;
+            overflow-y: auto;
+            flex: 1;
+        }
+        .cg-section {
+            background: rgba(255,255,255,0.1);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 16px;
+            backdrop-filter: blur(10px);
+        }
+        .cg-section-title {
+            font-size: 14px;
+            font-weight: bold;
+            margin-bottom: 12px;
+            opacity: 0.9;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .cg-input {
+            width: 100%;
+            padding: 10px 12px;
+            border: 2px solid rgba(255,255,255,0.2);
+            background: rgba(255,255,255,0.1);
+            border-radius: 8px;
+            color: white;
+            font-size: 13px;
+            margin-bottom: 8px;
+            transition: all 0.3s;
+        }
+        .cg-input:focus {
+            outline: none;
+            border-color: rgba(255,255,255,0.5);
+            background: rgba(255,255,255,0.15);
+        }
+        .cg-input::placeholder {
+            color: rgba(255,255,255,0.5);
+        }
+        .cg-btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            justify-content: center;
+        }
+        .cg-btn-primary {
+            background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+            color: #333;
+        }
+        .cg-btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(67,233,123,0.4);
+        }
+        .cg-btn-danger {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+        }
+        .cg-btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(245,87,108,0.4);
+        }
+        .cg-btn-secondary {
+            background: rgba(255,255,255,0.2);
+            color: white;
+        }
+        .cg-btn-secondary:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        .cg-btn-small {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+        .cg-btn-group {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .cg-course-list {
+            max-height: 200px;
+            overflow-y: auto;
+            margin-top: 12px;
+        }
+        .cg-course-item {
+            background: rgba(255,255,255,0.1);
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.3s;
+        }
+        .cg-course-item:hover {
+            background: rgba(255,255,255,0.15);
+        }
+        .cg-course-info {
+            flex: 1;
+            font-size: 13px;
+        }
+        .cg-course-code {
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+        .cg-course-meta {
+            font-size: 11px;
+            opacity: 0.8;
+        }
+        .cg-status {
+            padding: 8px 16px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 8px;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .cg-status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #43e97b;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .cg-log-area {
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            padding: 12px;
+            max-height: 150px;
+            overflow-y: auto;
+            font-size: 11px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            line-height: 1.6;
+        }
+        .cg-log-item {
+            margin-bottom: 4px;
+            opacity: 0.9;
+        }
+        .cg-log-success { color: #43e97b; }
+        .cg-log-error { color: #f5576c; }
+        .cg-log-warning { color: #ffa500; }
+        .cg-log-info { color: #38f9d7; }
+        .cg-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 4px;
+            font-size: 11px;
+            margin-left: 8px;
+        }
+        .cg-badge-success {
+            background: rgba(67,233,123,0.3);
+        }
+        .cg-badge-running {
+            background: rgba(56,249,215,0.3);
+        }
+        .cg-controls {
+            display: flex;
+            gap: 8px;
+        }
+        .cg-minimize {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+        }
+        .cg-minimize:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        .cg-minimized {
+            height: auto !important;
+            width: 60px !important;
+        }
+        .cg-minimized .cg-body {
+            display: none !important;
+        }
+        .cg-minimized .cg-title {
+            display: none !important;
+        }
+        .cg-filter-input {
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+        .cg-help-text {
+            font-size: 11px;
+            opacity: 0.7;
+            margin-top: 4px;
+        }
+        .cg-timer-display {
+            background: rgba(255,255,255,0.15);
+            padding: 16px;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 24px;
+            font-weight: bold;
+            letter-spacing: 2px;
+            margin-top: 12px;
+            font-family: 'Monaco', 'Menlo', monospace;
+        }
+        .cg-timer-active {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            animation: timerPulse 2s infinite;
+        }
+        @keyframes timerPulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.02); }
+        }
+        .cg-time-input-group {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        .cg-time-input-group input {
+            flex: 1;
+        }
+        .cg-course-filters {
+            background: rgba(0,0,0,0.2);
+            padding: 8px;
+            border-radius: 6px;
+            margin-top: 6px;
+            font-size: 11px;
+        }
+        .cg-course-filter-item {
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .cg-course-filter-item:last-child {
+            margin-bottom: 0;
+        }
+        .cg-filter-label {
+            opacity: 0.8;
+            min-width: 40px;
+        }
+        .cg-course-actions {
+            display: flex;
+            gap: 4px;
+            flex-direction: column;
+        }
+    `;
+    document.head.appendChild(style);
+
+    // 创建UI容器
+    const ui = document.createElement('div');
+    ui.id = 'courseGrabberUI';
+    ui.innerHTML = `
+        <div class="cg-header">
+            <div class="cg-title">
+                <span>🎓</span>
+                <span>自动抢课</span>
+            </div>
+            <div class="cg-controls">
+                <button class="cg-minimize" id="cg-minimize-btn" title="最小化">−</button>
+                <button class="cg-close" id="cg-close-btn" title="关闭">×</button>
+            </div>
+        </div>
+        <div class="cg-body">
+            <!-- 状态显示 -->
+            <div class="cg-section">
+                <div class="cg-section-title">📊 运行状态</div>
+                <div id="cg-status-display">
+                    <div class="cg-status">
+                        <span>状态:</span>
+                        <span id="cg-status-text">未运行</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 课程管理 -->
+            <div class="cg-section">
+                <div class="cg-section-title">📚 添加目标课程</div>
+                <input type="text" class="cg-input" id="cg-course-code" placeholder="课程号或课程名称 (例: 23286514 或 机器学习)">
+                <input type="number" class="cg-input" id="cg-course-priority" placeholder="优先级 (数字越小优先级越高)" value="1" min="1">
+                
+                <div class="cg-section-title" style="font-size: 13px; margin-top: 12px; margin-bottom: 8px;"> 目标课程的过滤器 (可选)</div>
+                <input type="text" class="cg-input cg-filter-input" id="cg-time-filter" placeholder="时间过滤 (例: 星期一,第1-2节)">
+                <div class="cg-help-text">多个关键词用逗号分隔，满足任意一个即可</div>
+                <input type="text" class="cg-input cg-filter-input" id="cg-teacher-filter" placeholder="教师过滤 (例: 张三,讲师)">
+                <div class="cg-help-text">支持教师姓名或职称，满足任意一个即可</div>
+
+                <div class="cg-section-title" style="font-size: 13px; margin-top: 12px; margin-bottom: 8px;"> 替换课程 (可选)</div>
+                <input type="text" class="cg-input cg-filter-input" id="cg-replace-code" placeholder="要替换的课程号 (例: 23306047)">
+                <div class="cg-help-text">选中新课程前，先退选此课程（用于换课）</div>
+                
+                <button class="cg-btn cg-btn-secondary cg-btn-small" id="cg-add-course" style="width: 100%; margin-top: 12px;">➕ 添加课程</button>
+            </div>
+
+            <!-- 目标课程列表 -->
+            <div class="cg-section">
+                <div class="cg-section-title">📋 目标课程列表</div>
+                <div class="cg-course-list" id="cg-course-list"></div>
+            </div>
+
+            <!-- 定时开抢 -->
+            <div class="cg-section">
+                <div class="cg-section-title">⏰ 定时开抢</div>
+                <div class="cg-time-input-group">
+                    <input type="datetime-local" class="cg-input" id="cg-schedule-time" placeholder="选择开抢时间">
+                    <button class="cg-btn cg-btn-secondary cg-btn-small" id="cg-schedule-btn">确定</button>
+                </div>
+                <div class="cg-help-text">设置自动开抢时间，到时自动开始抢课</div>
+                <div id="cg-timer-display" style="display: none;"></div>
+            </div>
+
+            <!-- 控制按钮 -->
+            <div class="cg-section">
+                <div class="cg-btn-group">
+                    <button class="cg-btn cg-btn-primary" id="cg-start-btn" style="flex: 1;">🚀 开始抢课</button>
+                    <button class="cg-btn cg-btn-danger" id="cg-stop-btn" style="flex: 1;" disabled>⏹️ 停止</button>
+                </div>
+                <div class="cg-btn-group">
+                    <button class="cg-btn" id="cg-grab-any-btn" style="background: linear-gradient(135deg, #FF9D6C 0%, #BB4E75 100%); color: white; flex: 1;">🔥 抢余课模式 (捡漏)</button>
+                </div>
+                <div class="cg-btn-group">
+                    <button class="cg-btn cg-btn-secondary cg-btn-small" id="cg-status-btn" style="flex: 1;">📊 查看状态</button>
+                    <button class="cg-btn cg-btn-secondary cg-btn-small" id="cg-debug-btn" style="flex: 1;">🔍 调试</button>
+                </div>
+            </div>
+
+            <!-- 日志显示 -->
+            <div class="cg-section">
+                <div class="cg-section-title">📝 运行日志</div>
+                <div class="cg-log-area" id="cg-log-area"></div>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(ui);
+
+    // 添加拖拽功能
+    makeDraggable(ui);
+
+    // 绑定事件
+    bindUIEvents();
+
+    // 初始化课程列表
+    updateCourseList();
+
+    // 劫持日志函数以显示在UI中
+    interceptLogs();
+
+    console.log('%c✨ UI界面已加载！可拖动面板到任意位置', 'color: #43e97b; font-weight: bold; font-size: 14px;');
+}
     // 使UI可拖拽
     function makeDraggable(element) {
         const header = element.querySelector('.cg-header');
@@ -2181,145 +2268,186 @@
         }
     }
 
-    // 绑定UI事件
-    function bindUIEvents() {
-        // 关闭按钮
-        document.getElementById('cg-close-btn').onclick = () => {
-            document.getElementById('courseGrabberUI').style.display = 'none';
-        };
+  // 绑定UI事件
+function bindUIEvents() {
+    // 关闭按钮
+    document.getElementById('cg-close-btn').onclick = () => {
+        document.getElementById('courseGrabberUI').style.display = 'none';
+    };
 
-        // 最小化按钮
-        document.getElementById('cg-minimize-btn').onclick = () => {
-            const ui = document.getElementById('courseGrabberUI');
-            ui.classList.toggle('cg-minimized');
-            const btn = document.getElementById('cg-minimize-btn');
-            btn.textContent = ui.classList.contains('cg-minimized') ? '□' : '−';
-        };
+    // 最小化按钮
+    document.getElementById('cg-minimize-btn').onclick = () => {
+        const ui = document.getElementById('courseGrabberUI');
+        ui.classList.toggle('cg-minimized');
+        const btn = document.getElementById('cg-minimize-btn');
+        btn.textContent = ui.classList.contains('cg-minimized') ? '□' : '−';
+    };
 
-        // 添加课程
-        document.getElementById('cg-add-course').onclick = () => {
-            const code = document.getElementById('cg-course-code').value.trim();
-            const priority = parseInt(document.getElementById('cg-course-priority').value) || 1;
+    // 添加课程
+    document.getElementById('cg-add-course').onclick = () => {
+        const code = document.getElementById('cg-course-code').value.trim();
+        const priority = parseInt(document.getElementById('cg-course-priority').value) || 1;
 
-            if (!code) {
-                alert('请输入课程号！');
+        if (!code) {
+            alert('请输入课程号！');
+            return;
+        }
+
+        // 检查是否已存在
+        if (TARGET_COURSES.some(c => c.code === code)) {
+            alert('该课程已存在！');
+            return;
+        }
+
+        // 获取替换课程和过滤器（使用querySelector作为备用方案）
+        const replaceCodeEl = document.getElementById('cg-replace-code');
+        const timeFilterEl = document.getElementById('cg-time-filter');
+        const teacherFilterEl = document.getElementById('cg-teacher-filter');
+
+        const replaceCode = (replaceCodeEl ? replaceCodeEl.value : '').trim();
+        const timeFilterInput = (timeFilterEl ? timeFilterEl.value : '').trim();
+        const teacherFilterInput = (teacherFilterEl ? teacherFilterEl.value : '').trim();
+
+        // 构造最终要推入的课程对象，避免作用域或外部修改影响
+        const finalCourse = { code: code, priority: priority };
+        if (replaceCode) finalCourse.replaceCode = replaceCode;
+
+        // 使用安全的解析函数处理过滤器输入（避免被篡改的 Array.prototype.filter）
+        const finalTimeFilter = safeParseFilterInput(timeFilterInput);
+        if (finalTimeFilter.length > 0) {
+            finalCourse.timeFilter = finalTimeFilter;
+        }
+
+        const finalTeacherFilter = safeParseFilterInput(teacherFilterInput);
+        if (finalTeacherFilter.length > 0) {
+            finalCourse.teacherFilter = finalTeacherFilter;
+        }
+
+        // 直接推入 finalCourse（是新对象）
+        TARGET_COURSES.push(finalCourse);
+
+        // 清空所有输入
+        document.getElementById('cg-course-code').value = '';
+        document.getElementById('cg-course-priority').value = '1';
+        document.getElementById('cg-replace-code').value = '';
+        document.getElementById('cg-time-filter').value = '';
+        document.getElementById('cg-teacher-filter').value = '';
+
+        updateCourseList();
+
+        let logMsg = `已添加课程: ${code} (优先级: ${priority})`;
+        if (finalCourse.replaceCode) logMsg += ` [替换: ${finalCourse.replaceCode}]`;
+        if (finalCourse.timeFilter && finalCourse.timeFilter.length > 0) {
+            logMsg += ` [时间过滤: ${finalCourse.timeFilter.join(', ')}]`;
+        }
+        if (finalCourse.teacherFilter && finalCourse.teacherFilter.length > 0) {
+            logMsg += ` [教师过滤: ${finalCourse.teacherFilter.join(', ')}]`;
+        }
+        addUILog('success', logMsg);
+    };
+
+    // [新增] 抢余课模式按钮事件
+   // [新增] 抢余课模式按钮事件
+        document.getElementById('cg-grab-any-btn').onclick = () => {
+            if (isRunning) {
+                alert('脚本正在运行中，请先停止！');
                 return;
             }
+            
+            if (confirm('⚠️ 警告：抢余课模式将自动选择页面上所有“人数未满”且“可选”的课程...\n是否继续？')) {
+                ANY_COURSE_MODE = true; 
+                
+                // 1. 自动展开变量设置（配合上面的 let 修改）
+                CLICK2EXPEND_ENABLED = true; 
+                click2expend_enabled = true;
+                
+                // 2. [新增] 立即执行一次物理展开，确保能扫描到 DOM
+                expandAllCourses(); 
 
-            // 检查是否已存在
-            if (TARGET_COURSES.some(c => c.code === code)) {
-                alert('该课程已存在！');
-                return;
+                // 3. 延迟一点点启动，给展开动画留时间
+                setTimeout(() => {
+                    window.grab.start();
+                }, 500);
+                
+                // 更新UI状态
+                document.getElementById('cg-start-btn').disabled = true;
+                document.getElementById('cg-grab-any-btn').disabled = true;
+                document.getElementById('cg-stop-btn').disabled = false;
+                document.getElementById('cg-grab-any-btn').textContent = '🔥 正在捡漏中...';
+                
+                addUILog('warning', '🔥 已启动无差别抢余课模式！');
             }
-
-            // 获取替换课程和过滤器（使用querySelector作为备用方案）
-            const replaceCodeEl = document.getElementById('cg-replace-code');
-            const timeFilterEl = document.getElementById('cg-time-filter');
-            const teacherFilterEl = document.getElementById('cg-teacher-filter');
-
-            const replaceCode = (replaceCodeEl ? replaceCodeEl.value : '').trim();
-            const timeFilterInput = (timeFilterEl ? timeFilterEl.value : '').trim();
-            const teacherFilterInput = (teacherFilterEl ? teacherFilterEl.value : '').trim();
-
-            // 构造最终要推入的课程对象，避免作用域或外部修改影响
-            const finalCourse = { code: code, priority: priority };
-            if (replaceCode) finalCourse.replaceCode = replaceCode;
-
-            // 使用安全的解析函数处理过滤器输入（避免被篡改的 Array.prototype.filter）
-            const finalTimeFilter = safeParseFilterInput(timeFilterInput);
-            if (finalTimeFilter.length > 0) {
-                finalCourse.timeFilter = finalTimeFilter;
-            }
-
-            const finalTeacherFilter = safeParseFilterInput(teacherFilterInput);
-            if (finalTeacherFilter.length > 0) {
-                finalCourse.teacherFilter = finalTeacherFilter;
-            }
-
-            // 直接推入 finalCourse（是新对象）
-            TARGET_COURSES.push(finalCourse);
-
-            // 清空所有输入
-            document.getElementById('cg-course-code').value = '';
-            document.getElementById('cg-course-priority').value = '1';
-            document.getElementById('cg-replace-code').value = '';
-            document.getElementById('cg-time-filter').value = '';
-            document.getElementById('cg-teacher-filter').value = '';
-
-            updateCourseList();
-
-            let logMsg = `已添加课程: ${code} (优先级: ${priority})`;
-            if (finalCourse.replaceCode) logMsg += ` [替换: ${finalCourse.replaceCode}]`;
-            if (finalCourse.timeFilter && finalCourse.timeFilter.length > 0) {
-                logMsg += ` [时间过滤: ${finalCourse.timeFilter.join(', ')}]`;
-            }
-            if (finalCourse.teacherFilter && finalCourse.teacherFilter.length > 0) {
-                logMsg += ` [教师过滤: ${finalCourse.teacherFilter.join(', ')}]`;
-            }
-            addUILog('success', logMsg);
         };
 
-        // 开始抢课
-        document.getElementById('cg-start-btn').onclick = () => {
-            if (TARGET_COURSES.length === 0) {
-                alert('请先添加至少一门课程！');
-                return;
-            }
+    // [修改] 普通开始按钮点击时，确保关闭抢余课模式
+    document.getElementById('cg-start-btn').onclick = () => {
+        if (TARGET_COURSES.length === 0) {
+            alert('请先添加至少一门课程！');
+            return;
+        }
+        
+        ANY_COURSE_MODE = false; // 确保关闭
+        window.grab.start();
+        document.getElementById('cg-start-btn').disabled = true;
+        document.getElementById('cg-stop-btn').disabled = false;
+        updateStatusDisplay();
+    };
 
-            window.grab.start();
-            document.getElementById('cg-start-btn').disabled = true;
-            document.getElementById('cg-stop-btn').disabled = false;
-            updateStatusDisplay();
-        };
+    // [修改] 停止按钮逻辑，重置按钮状态
+    document.getElementById('cg-stop-btn').onclick = () => {
+        window.grab.stop();
+        ANY_COURSE_MODE = false; // 重置模式
+        
+        document.getElementById('cg-start-btn').disabled = false;
+        document.getElementById('cg-stop-btn').disabled = true;
+        
+        // 恢复抢余课按钮
+        const anyBtn = document.getElementById('cg-grab-any-btn');
+        anyBtn.disabled = false;
+        anyBtn.textContent = '🔥 抢余课模式 (捡漏)';
+        
+        updateStatusDisplay();
+    };
 
-        // 停止抢课
-        document.getElementById('cg-stop-btn').onclick = () => {
-            window.grab.stop();
-            document.getElementById('cg-start-btn').disabled = false;
-            document.getElementById('cg-stop-btn').disabled = true;
-            updateStatusDisplay();
-        };
+    // 查看状态
+    document.getElementById('cg-status-btn').onclick = () => {
+        window.grab.status();
+    };
 
-        // 查看状态
-        document.getElementById('cg-status-btn').onclick = () => {
-            window.grab.status();
-        };
+    // 调试
+    document.getElementById('cg-debug-btn').onclick = () => {
+        window.grab.debug();
+    };
 
-        // 调试
-        document.getElementById('cg-debug-btn').onclick = () => {
-            window.grab.debug();
-        };
+    // 定时开抢
+    document.getElementById('cg-schedule-btn').onclick = () => {
+        const timeInput = document.getElementById('cg-schedule-time');
+        const timeValue = timeInput.value;
 
-        // 定时开抢
-        document.getElementById('cg-schedule-btn').onclick = () => {
-            const timeInput = document.getElementById('cg-schedule-time');
-            const timeValue = timeInput.value;
+        if (!timeValue) {
+            alert('请先选择开抢时间！');
+            return;
+        }
 
-            if (!timeValue) {
-                alert('请先选择开抢时间！');
-                return;
-            }
+        const scheduleTime = new Date(timeValue);
+        const now = new Date();
 
-            const scheduleTime = new Date(timeValue);
-            const now = new Date();
+        if (scheduleTime <= now) {
+            alert('开抢时间必须大于当前时间！');
+            return;
+        }
 
-            if (scheduleTime <= now) {
-                alert('开抢时间必须大于当前时间！');
-                return;
-            }
+        if (TARGET_COURSES.length === 0) {
+            alert('请先添加至少一门课程！');
+            return;
+        }
 
-            if (TARGET_COURSES.length === 0) {
-                alert('请先添加至少一门课程！');
-                return;
-            }
+        setScheduledStart(scheduleTime);
+    };
 
-            setScheduledStart(scheduleTime);
-        };
-
-        // 定期更新状态
-        setInterval(updateStatusDisplay, 1000);
-    }
-
+    // 定期更新状态
+    setInterval(updateStatusDisplay, 1000);
+}
     // 更新课程列表显示
     function updateCourseList() {
         const list = document.getElementById('cg-course-list');
