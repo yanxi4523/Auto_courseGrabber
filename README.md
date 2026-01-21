@@ -1,3 +1,6 @@
+
+新增抢余课功能，并修复了列表未展开时找不到课程的问题
+
 # 🎓 教务系统自动抢课脚本
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
